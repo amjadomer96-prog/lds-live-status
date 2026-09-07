@@ -49,14 +49,30 @@ const list = (k: string) =>
         .map((s) => s.trim())
         .filter(Boolean)
  
+/** Records what every Figma call actually did, so a zero result explains itself. */
+const trace: Array<{ call: string; status: number | string; note?: string }> = []
+ 
 async function figmaGet<T>(path: string, token: string): Promise<T | null> {
+    const label = path.split("?")[0]
     try {
         const res = await fetch(`${FIGMA}${path}`, {
             headers: { "X-Figma-Token": token },
         })
-        if (!res.ok) return null
+        if (!res.ok) {
+            let note = ""
+            try {
+                const body: any = await res.json()
+                note = body?.err || body?.message || ""
+            } catch {
+                /* non-JSON error body */
+            }
+            trace.push({ call: label, status: res.status, note })
+            return null
+        }
+        trace.push({ call: label, status: res.status })
         return (await res.json()) as T
-    } catch {
+    } catch (e: any) {
+        trace.push({ call: label, status: "network_error", note: String(e?.message || e) })
         return null
     }
 }
@@ -79,12 +95,24 @@ async function filesAcrossTeams(
         const projects = await figmaGet<{
             projects?: Array<{ id: string; name: string }>
         }>(`/teams/${teamId}/projects`, token)
-        for (const project of projects?.projects || []) {
+        const projectList = projects?.projects || []
+        trace.push({
+            call: `team ${teamId}`,
+            status: projects ? "ok" : "failed",
+            note: `${projectList.length} project(s)`,
+        })
+        for (const project of projectList) {
             const files = await figmaGet<{ files?: ProjectFile[] }>(
                 `/projects/${project.id}/files`,
                 token
             )
-            for (const f of files?.files || []) {
+            const fileList = files?.files || []
+            trace.push({
+                call: `project "${project.name}"`,
+                status: files ? "ok" : "failed",
+                note: `${fileList.length} file(s)`,
+            })
+            for (const f of fileList) {
                 if (f && f.key) out.push(f)
             }
         }
@@ -96,6 +124,7 @@ async function filesAcrossTeams(
 }
  
 export default async function handler(req: any, res: any) {
+    trace.length = 0 // warm lambdas reuse the module scope; start each request clean
     res.setHeader("Access-Control-Allow-Origin", "*")
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS")
     res.setHeader(
@@ -252,6 +281,13 @@ export default async function handler(req: any, res: any) {
         filesWatched,
         teamsConfigured: teamIds.length,
         embedPolicy: allowAll ? "all files (unrestricted)" : "allowlist only",
+        diagnostics: {
+            hint:
+                filesWatched === 0 && teamIds.length
+                    ? "No files found in the team. Figma's API cannot see files kept in Drafts \u2014 move them into a Project inside the team, or check the token's scope."
+                    : "",
+            calls: trace,
+        },
         designers,
         activities,
     })
