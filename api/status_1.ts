@@ -1,34 +1,5 @@
-/**
- * LDS Live Studio — status endpoint.
- *
- * Watches Figma and publishes a small PUBLIC JSON status. The Figma token
- * stays on the server and never appears in the response.
- *
- * TWO SEPARATE THINGS, deliberately:
- *
- *   DETECTION  — can cover every file the token can see. Only timestamps
- *                leave Figma, and only "someone is working" reaches the page.
- *   EMBEDDING  — putting a file on a public web page. Restricted to an
- *                explicit allowlist, because an embed publishes the whole
- *                file to anyone who opens the site.
- *
- * Environment variables
- *   FIGMA_TOKEN           required. Personal access token.
- *   FIGMA_TEAM_IDS        comma-separated team ids -> watch every file in them.
- *                         Needs a token with the "Projects" read scope.
- *   WATCH_FILE_KEYS       comma-separated file keys to watch directly. Works with
- *                         only the "File content" read scope, so use this when the
- *                         Projects scope is unavailable. Combines with team ids.
- *   LIVE_STUDIO_CONFIG    optional JSON array of {name, role, fileKey} to watch
- *                         specific files instead of / as well as whole teams.
- *   PUBLIC_FILE_KEYS      comma-separated file keys allowed to be EMBEDDED.
- *   ALLOW_ALL_EMBEDS      "true" embeds whatever is active. Read the README
- *                         before setting this: it can publish client work.
- *   DESIGNER_NAME         name shown for team-wide detection. Default "Arham".
- *   DESIGNER_ROLE         default "Product Designer".
- *   LIVE_WINDOW_MINUTES   silence before going offline. Default 10.
- */
 
+ 
 interface DesignerConfig {
     name: string
     role?: string
@@ -36,26 +7,28 @@ interface DesignerConfig {
     framerUrl?: string
     avatar?: string
 }
-
+ 
 interface ProjectFile {
     key: string
     name: string
     last_modified?: string
     thumbnail_url?: string
+    /** Figma page names. Only present on files fetched by key. */
+    pages?: string[]
 }
-
+ 
 const FIGMA = "https://api.figma.com/v1"
-
+ 
 const env = (k: string, d = "") => (process.env[k] ?? d).trim()
 const list = (k: string) =>
     env(k)
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean)
-
+ 
 /** Records what every Figma call actually did, so a zero result explains itself. */
 const trace: Array<{ call: string; status: number | string; note?: string }> = []
-
+ 
 async function figmaGet<T>(path: string, token: string): Promise<T | null> {
     const label = path.split("?")[0]
     try {
@@ -80,7 +53,7 @@ async function figmaGet<T>(path: string, token: string): Promise<T | null> {
         return null
     }
 }
-
+ 
 function hhmm(iso: string): string {
     const d = new Date(iso)
     if (Number.isNaN(d.getTime())) return ""
@@ -88,7 +61,7 @@ function hhmm(iso: string): string {
         d.getUTCMinutes()
     ).padStart(2, "0")}`
 }
-
+ 
 /** Every file across every configured team, newest first. */
 async function filesAcrossTeams(
     teamIds: string[],
@@ -126,7 +99,7 @@ async function filesAcrossTeams(
             Date.parse(b.last_modified || "") - Date.parse(a.last_modified || "")
     )
 }
-
+ 
 /** Watch a plain list of file keys. Needs only the "File content" read scope. */
 async function filesByKeys(
     keys: string[],
@@ -134,15 +107,19 @@ async function filesByKeys(
 ): Promise<ProjectFile[]> {
     const out: ProjectFile[] = []
     for (const key of keys) {
-        const file = await figmaGet<{ name: string; lastModified: string }>(
-            `/files/${key}?depth=1`,
-            token
-        )
+        const file = await figmaGet<{
+            name: string
+            lastModified: string
+            document?: any
+        }>(`/files/${key}?depth=1`, token)
         if (!file) continue
         out.push({
             key,
             name: file.name,
             last_modified: file.lastModified,
+            pages: (file.document?.children || [])
+                .map((c: any) => (c?.name || "").trim())
+                .filter(Boolean),
         })
     }
     return out.sort(
@@ -150,7 +127,7 @@ async function filesByKeys(
             Date.parse(b.last_modified || "") - Date.parse(a.last_modified || "")
     )
 }
-
+ 
 export default async function handler(req: any, res: any) {
     trace.length = 0 // warm lambdas reuse the module scope; start each request clean
     res.setHeader("Access-Control-Allow-Origin", "*")
@@ -160,7 +137,7 @@ export default async function handler(req: any, res: any) {
         "public, s-maxage=30, stale-while-revalidate=120"
     )
     if (req.method === "OPTIONS") return res.status(204).end()
-
+ 
     const token = env("FIGMA_TOKEN")
     const teamIds = list("FIGMA_TEAM_IDS")
     const watchKeys = list("WATCH_FILE_KEYS")
@@ -169,7 +146,7 @@ export default async function handler(req: any, res: any) {
     const windowMin = Number(env("LIVE_WINDOW_MINUTES", "10")) || 10
     const windowMs = windowMin * 60 * 1000
     const now = Date.now()
-
+ 
     let explicit: DesignerConfig[] = []
     try {
         const raw = env("LIVE_STUDIO_CONFIG")
@@ -182,7 +159,7 @@ export default async function handler(req: any, res: any) {
     } catch {
         /* ignore malformed config */
     }
-
+ 
     if (!token) {
         return res.status(200).json({
             generatedAt: new Date(now).toISOString(),
@@ -201,7 +178,7 @@ export default async function handler(req: any, res: any) {
             error: "missing_config",
         })
     }
-
+ 
     /* ---------------- explicit files (per-designer mapping) ------------- */
     const designers: any[] = []
     for (const cfg of explicit) {
@@ -235,7 +212,7 @@ export default async function handler(req: any, res: any) {
             privateSession: isLive && !canEmbed,
         })
     }
-
+ 
     /* ---------------- team-wide detection ------------------------------- */
     let activities: Array<{ time: string; title: string }> = []
     let filesWatched = 0
@@ -260,8 +237,12 @@ export default async function handler(req: any, res: any) {
             return !Number.isNaN(t) && now - t <= windowMs
         })
         const active = recent[0]
-
-        if (active) {
+        // a file already covered by LIVE_STUDIO_CONFIG has its own panel above
+        const coveredByExplicit = active
+            ? explicit.some((c) => c.fileKey === active.key)
+            : false
+ 
+        if (active && !coveredByExplicit) {
             const canEmbed = allowAll || allowKeys.has(active.key)
             designers.push({
                 name: env("DESIGNER_NAME", "Arham"),
@@ -269,7 +250,7 @@ export default async function handler(req: any, res: any) {
                 avatar: "",
                 isLive: true,
                 project: canEmbed ? active.name : "A private project",
-                task: "",
+                task: canEmbed ? active.pages?.[0] || "" : "",
                 platform: "figma",
                 sessionStartedAt:
                     recent[recent.length - 1]?.last_modified ||
@@ -284,7 +265,7 @@ export default async function handler(req: any, res: any) {
                 framerUrl: "",
                 privateSession: !canEmbed,
             })
-
+ 
             activities = recent
                 .slice(0, 6)
                 .map((f) => ({
@@ -295,7 +276,7 @@ export default async function handler(req: any, res: any) {
                             : "Worked on a private project",
                 }))
                 .filter((a) => a.time)
-        } else {
+        } else if (!explicit.length) {
             designers.push({
                 name: env("DESIGNER_NAME", "Arham"),
                 role: env("DESIGNER_ROLE", "Product Designer"),
@@ -312,9 +293,9 @@ export default async function handler(req: any, res: any) {
             })
         }
     }
-
+ 
     const live = designers.filter((d) => d.isLive)
-
+ 
     return res.status(200).json({
         generatedAt: new Date(now).toISOString(),
         isLive: live.length > 0,
