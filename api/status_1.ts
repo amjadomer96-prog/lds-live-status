@@ -1,5 +1,3 @@
-
- 
 interface DesignerConfig {
     name: string
     role?: string
@@ -31,9 +29,13 @@ const list = (k: string) =>
         .filter(Boolean)
  
 /** Records what every Figma call actually did, so a zero result explains itself. */
-const trace: Array<{ call: string; status: number | string; note?: string }> = []
+type Trace = Array<{ call: string; status: number | string; note?: string }>
  
-async function figmaGet<T>(path: string, token: string): Promise<T | null> {
+async function figmaGet<T>(
+    path: string,
+    token: string,
+    trace: Trace
+): Promise<T | null> {
     const label = path.split("?")[0]
     try {
         const res = await fetch(figmaUrl(path), {
@@ -75,7 +77,8 @@ function hhmm(iso: string): string {
  */
 async function filesAcrossTeams(
     teamIds: string[],
-    token: string
+    token: string,
+    trace: Trace
 ): Promise<ProjectFile[]> {
     const out: ProjectFile[] = []
     const seenFolders = new Set<string>()
@@ -86,7 +89,7 @@ async function filesAcrossTeams(
  
         const files = await figmaGet<{ files?: ProjectFile[] }>(
             `/v2/folders/${folder.id}/files`,
-            token
+            token, trace
         )
         const fileList = files?.files || []
         trace.push({
@@ -99,7 +102,8 @@ async function filesAcrossTeams(
         // Nested folders, where the account has them. Undocumented, so failure is fine.
         const sub = await figmaGet<{ folders?: Array<{ id: string; name?: string }> }>(
             `/v2/folders/${folder.id}/folders`,
-            token
+            token,
+            trace
         )
         for (const child of sub?.folders || []) {
             if (child?.id) await readFolder(child, depth + 1)
@@ -109,7 +113,7 @@ async function filesAcrossTeams(
     for (const teamId of teamIds) {
         const res = await figmaGet<{
             folders?: Array<{ id: string; name?: string }>
-        }>(`/v2/teams/${teamId}/folders`, token)
+        }>(`/v2/teams/${teamId}/folders`, token, trace)
         const folders = res?.folders || []
         trace.push({
             call: `team ${teamId}`,
@@ -133,7 +137,8 @@ async function filesAcrossTeams(
 /** Watch a plain list of file keys. Needs only the "File content" read scope. */
 async function filesByKeys(
     keys: string[],
-    token: string
+    token: string,
+    trace: Trace
 ): Promise<ProjectFile[]> {
     const out: ProjectFile[] = []
     for (const key of keys) {
@@ -141,7 +146,7 @@ async function filesByKeys(
             name: string
             lastModified: string
             document?: any
-        }>(`/files/${key}?depth=1`, token)
+        }>(`/files/${key}?depth=1`, token, trace)
         if (!file) continue
         out.push({
             key,
@@ -159,7 +164,8 @@ async function filesByKeys(
 }
  
 export default async function handler(req: any, res: any) {
-    trace.length = 0 // warm lambdas reuse the module scope; start each request clean
+    // request-local: concurrent invocations share a warm lambda's module scope
+    const trace: Trace = []
     res.setHeader("Access-Control-Allow-Origin", "*")
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS")
     res.setHeader(
@@ -214,7 +220,8 @@ export default async function handler(req: any, res: any) {
     for (const cfg of explicit) {
         const file = await figmaGet<{ name: string; lastModified: string; document?: any }>(
             `/files/${cfg.fileKey}?depth=1`,
-            token
+            token,
+            trace
         )
         if (!file) continue
         const modified = Date.parse(file.lastModified)
@@ -248,10 +255,10 @@ export default async function handler(req: any, res: any) {
     let filesWatched = 0
     if (teamIds.length || watchKeys.length) {
         const fromTeams = teamIds.length
-            ? await filesAcrossTeams(teamIds, token)
+            ? await filesAcrossTeams(teamIds, token, trace)
             : []
         const fromKeys = watchKeys.length
-            ? await filesByKeys(watchKeys, token)
+            ? await filesByKeys(watchKeys, token, trace)
             : []
         // team results win on duplicate keys
         const merged = new Map<string, ProjectFile>()
