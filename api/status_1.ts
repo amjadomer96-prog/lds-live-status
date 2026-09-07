@@ -1,17 +1,30 @@
 /**
  * LDS Live Studio — status endpoint.
  *
- * Polls the Figma REST API and publishes a small, PUBLIC JSON document
- * describing who is working and on what. The Figma token stays on the server
- * and is never included in the response.
+ * Watches Figma and publishes a small PUBLIC JSON status. The Figma token
+ * stays on the server and never appears in the response.
  *
- * Deploy on Vercel. Required environment variable:
- *   FIGMA_TOKEN          personal access token (Figma → Settings → Security)
- *   LIVE_STUDIO_CONFIG   JSON array, one entry per designer (see README)
- * Optional:
- *   LIVE_WINDOW_MINUTES  minutes of silence before going offline (default 10)
+ * TWO SEPARATE THINGS, deliberately:
+ *
+ *   DETECTION  — can cover every file the token can see. Only timestamps
+ *                leave Figma, and only "someone is working" reaches the page.
+ *   EMBEDDING  — putting a file on a public web page. Restricted to an
+ *                explicit allowlist, because an embed publishes the whole
+ *                file to anyone who opens the site.
+ *
+ * Environment variables
+ *   FIGMA_TOKEN           required. Personal access token.
+ *   FIGMA_TEAM_IDS        comma-separated team ids -> watch every file in them.
+ *   LIVE_STUDIO_CONFIG    optional JSON array of {name, role, fileKey} to watch
+ *                         specific files instead of / as well as whole teams.
+ *   PUBLIC_FILE_KEYS      comma-separated file keys allowed to be EMBEDDED.
+ *   ALLOW_ALL_EMBEDS      "true" embeds whatever is active. Read the README
+ *                         before setting this: it can publish client work.
+ *   DESIGNER_NAME         name shown for team-wide detection. Default "Arham".
+ *   DESIGNER_ROLE         default "Product Designer".
+ *   LIVE_WINDOW_MINUTES   silence before going offline. Default 10.
  */
-
+ 
 interface DesignerConfig {
     name: string
     role?: string
@@ -19,39 +32,23 @@ interface DesignerConfig {
     framerUrl?: string
     avatar?: string
 }
-
-interface FigmaFile {
+ 
+interface ProjectFile {
+    key: string
     name: string
-    lastModified: string
-    document?: { children?: Array<{ name?: string }> }
+    last_modified?: string
+    thumbnail_url?: string
 }
-
-interface FigmaVersion {
-    id: string
-    created_at: string
-    label?: string
-    description?: string
-    user?: { handle?: string; img_url?: string }
-}
-
+ 
 const FIGMA = "https://api.figma.com/v1"
-
-function env(key: string, fallback = ""): string {
-    return (process.env[key] ?? fallback).trim()
-}
-
-function readConfig(): DesignerConfig[] {
-    const raw = env("LIVE_STUDIO_CONFIG")
-    if (!raw) return []
-    try {
-        const parsed = JSON.parse(raw)
-        if (!Array.isArray(parsed)) return []
-        return parsed.filter((d) => d && d.name && d.fileKey)
-    } catch {
-        return []
-    }
-}
-
+ 
+const env = (k: string, d = "") => (process.env[k] ?? d).trim()
+const list = (k: string) =>
+    env(k)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+ 
 async function figmaGet<T>(path: string, token: string): Promise<T | null> {
     try {
         const res = await fetch(`${FIGMA}${path}`, {
@@ -63,8 +60,7 @@ async function figmaGet<T>(path: string, token: string): Promise<T | null> {
         return null
     }
 }
-
-/** "14:07" in UTC — the component re-displays it verbatim. */
+ 
 function hhmm(iso: string): string {
     const d = new Date(iso)
     if (Number.isNaN(d.getTime())) return ""
@@ -72,138 +68,191 @@ function hhmm(iso: string): string {
         d.getUTCMinutes()
     ).padStart(2, "0")}`
 }
-
-/**
- * Turn Figma version history into readable activity lines.
- * A named version uses its label; an autosave falls back to the page name.
- */
-function toActivities(
-    versions: FigmaVersion[],
-    pageNames: string[],
-    windowMs: number
-): Array<{ time: string; title: string }> {
-    const now = Date.now()
-    const fallback = pageNames[0] || "the file"
-    return versions
-        .filter((v) => {
-            const t = Date.parse(v.created_at)
-            return !Number.isNaN(t) && now - t <= windowMs * 6
-        })
-        .slice(0, 6)
-        .map((v) => ({
-            time: hhmm(v.created_at),
-            title:
-                (v.label && v.label.trim()) ||
-                (v.description && v.description.trim()) ||
-                `Updated ${fallback}`,
-        }))
-        .filter((a) => a.time)
+ 
+/** Every file across every configured team, newest first. */
+async function filesAcrossTeams(
+    teamIds: string[],
+    token: string
+): Promise<ProjectFile[]> {
+    const out: ProjectFile[] = []
+    for (const teamId of teamIds) {
+        const projects = await figmaGet<{
+            projects?: Array<{ id: string; name: string }>
+        }>(`/teams/${teamId}/projects`, token)
+        for (const project of projects?.projects || []) {
+            const files = await figmaGet<{ files?: ProjectFile[] }>(
+                `/projects/${project.id}/files`,
+                token
+            )
+            for (const f of files?.files || []) {
+                if (f && f.key) out.push(f)
+            }
+        }
+    }
+    return out.sort(
+        (a, b) =>
+            Date.parse(b.last_modified || "") - Date.parse(a.last_modified || "")
+    )
 }
-
+ 
 export default async function handler(req: any, res: any) {
     res.setHeader("Access-Control-Allow-Origin", "*")
     res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS")
-    // Cached at the edge so Figma is polled at most twice a minute.
     res.setHeader(
         "Cache-Control",
         "public, s-maxage=30, stale-while-revalidate=120"
     )
     if (req.method === "OPTIONS") return res.status(204).end()
-
+ 
     const token = env("FIGMA_TOKEN")
-    const config = readConfig()
+    const teamIds = list("FIGMA_TEAM_IDS")
+    const allowKeys = new Set(list("PUBLIC_FILE_KEYS"))
+    const allowAll = env("ALLOW_ALL_EMBEDS").toLowerCase() === "true"
     const windowMin = Number(env("LIVE_WINDOW_MINUTES", "10")) || 10
     const windowMs = windowMin * 60 * 1000
     const now = Date.now()
-
-    const base = {
-        generatedAt: new Date(now).toISOString(),
-        isLive: false,
-        designers: [] as any[],
-        activities: [] as any[],
-        error: "",
+ 
+    let explicit: DesignerConfig[] = []
+    try {
+        const raw = env("LIVE_STUDIO_CONFIG")
+        if (raw) {
+            const parsed = JSON.parse(raw)
+            if (Array.isArray(parsed)) {
+                explicit = parsed.filter((d) => d && d.name && d.fileKey)
+            }
+        }
+    } catch {
+        /* ignore malformed config */
     }
-
-    if (!token || config.length === 0) {
-        base.error = !token ? "missing_token" : "missing_config"
-        return res.status(200).json(base)
-    }
-
-    const designers = await Promise.all(
-        config.map(async (cfg) => {
-            const file = await figmaGet<FigmaFile>(
-                `/files/${cfg.fileKey}?depth=1`,
-                token
-            )
-            if (!file) {
-                return {
-                    name: cfg.name,
-                    role: cfg.role || "",
-                    isLive: false,
-                    unreachable: true,
-                }
-            }
-            const modified = Date.parse(file.lastModified)
-            const isLive =
-                !Number.isNaN(modified) && now - modified <= windowMs
-
-            const pageNames = (file.document?.children || [])
-                .map((c) => (c?.name || "").trim())
-                .filter(Boolean)
-
-            let versions: FigmaVersion[] = []
-            if (isLive) {
-                const v = await figmaGet<{ versions: FigmaVersion[] }>(
-                    `/files/${cfg.fileKey}/versions`,
-                    token
-                )
-                versions = (v && v.versions) || []
-            }
-
-            // Session start = oldest edit in the current unbroken run.
-            let sessionStartedAt = file.lastModified
-            for (const v of versions) {
-                const t = Date.parse(v.created_at)
-                if (Number.isNaN(t)) continue
-                if (now - t <= windowMs * 6) sessionStartedAt = v.created_at
-            }
-
-            return {
-                name: cfg.name,
-                role: cfg.role || "",
-                avatar: cfg.avatar || "",
-                isLive,
-                project: file.name,
-                task: pageNames[0] || "",
-                platform: "figma",
-                sessionStartedAt: isLive ? sessionStartedAt : "",
-                lastUpdated: file.lastModified,
-                figmaUrl: `https://www.figma.com/design/${cfg.fileKey}/${encodeURIComponent(
-                    file.name.replace(/\s+/g, "-")
-                )}`,
-                framerUrl: cfg.framerUrl || "",
-                _versions: isLive ? versions : [],
-                _pages: pageNames,
-            }
+ 
+    if (!token) {
+        return res.status(200).json({
+            generatedAt: new Date(now).toISOString(),
+            isLive: false,
+            designers: [],
+            activities: [],
+            error: "missing_token",
         })
-    )
-
-    const live = designers.filter((d: any) => d.isLive)
-    const activities = live.length
-        ? toActivities(
-              (live[0] as any)._versions || [],
-              (live[0] as any)._pages || [],
-              windowMs
-          )
-        : []
-
-    const clean = designers.map(({ _versions, _pages, ...rest }: any) => rest)
-
+    }
+    if (!teamIds.length && !explicit.length) {
+        return res.status(200).json({
+            generatedAt: new Date(now).toISOString(),
+            isLive: false,
+            designers: [],
+            activities: [],
+            error: "missing_config",
+        })
+    }
+ 
+    /* ---------------- explicit files (per-designer mapping) ------------- */
+    const designers: any[] = []
+    for (const cfg of explicit) {
+        const file = await figmaGet<{ name: string; lastModified: string; document?: any }>(
+            `/files/${cfg.fileKey}?depth=1`,
+            token
+        )
+        if (!file) continue
+        const modified = Date.parse(file.lastModified)
+        const isLive = !Number.isNaN(modified) && now - modified <= windowMs
+        const canEmbed = allowAll || allowKeys.has(cfg.fileKey)
+        const pages = (file.document?.children || [])
+            .map((c: any) => (c?.name || "").trim())
+            .filter(Boolean)
+        designers.push({
+            name: cfg.name,
+            role: cfg.role || "",
+            avatar: cfg.avatar || "",
+            isLive,
+            project: file.name,
+            task: pages[0] || "",
+            platform: "figma",
+            sessionStartedAt: isLive ? file.lastModified : "",
+            lastUpdated: file.lastModified,
+            figmaUrl: canEmbed
+                ? `https://www.figma.com/design/${cfg.fileKey}/${encodeURIComponent(
+                      file.name.replace(/\s+/g, "-")
+                  )}`
+                : "",
+            framerUrl: cfg.framerUrl || "",
+            privateSession: isLive && !canEmbed,
+        })
+    }
+ 
+    /* ---------------- team-wide detection ------------------------------- */
+    let activities: Array<{ time: string; title: string }> = []
+    let filesWatched = 0
+    if (teamIds.length) {
+        const all = await filesAcrossTeams(teamIds, token)
+        filesWatched = all.length
+        const recent = all.filter((f) => {
+            const t = Date.parse(f.last_modified || "")
+            return !Number.isNaN(t) && now - t <= windowMs
+        })
+        const active = recent[0]
+ 
+        if (active) {
+            const canEmbed = allowAll || allowKeys.has(active.key)
+            designers.push({
+                name: env("DESIGNER_NAME", "Arham"),
+                role: env("DESIGNER_ROLE", "Product Designer"),
+                avatar: "",
+                isLive: true,
+                project: canEmbed ? active.name : "A private project",
+                task: "",
+                platform: "figma",
+                sessionStartedAt:
+                    recent[recent.length - 1]?.last_modified ||
+                    active.last_modified ||
+                    "",
+                lastUpdated: active.last_modified || "",
+                figmaUrl: canEmbed
+                    ? `https://www.figma.com/design/${active.key}/${encodeURIComponent(
+                          (active.name || "file").replace(/\s+/g, "-")
+                      )}`
+                    : "",
+                framerUrl: "",
+                privateSession: !canEmbed,
+            })
+ 
+            activities = recent
+                .slice(0, 6)
+                .map((f) => ({
+                    time: hhmm(f.last_modified || ""),
+                    title:
+                        allowAll || allowKeys.has(f.key)
+                            ? `Updated ${f.name}`
+                            : "Worked on a private project",
+                }))
+                .filter((a) => a.time)
+        } else {
+            designers.push({
+                name: env("DESIGNER_NAME", "Arham"),
+                role: env("DESIGNER_ROLE", "Product Designer"),
+                avatar: "",
+                isLive: false,
+                project: "",
+                task: "",
+                platform: "figma",
+                sessionStartedAt: "",
+                lastUpdated: all[0]?.last_modified || "",
+                figmaUrl: "",
+                framerUrl: "",
+                privateSession: false,
+            })
+        }
+    }
+ 
+    const live = designers.filter((d) => d.isLive)
+ 
     return res.status(200).json({
-        generatedAt: base.generatedAt,
+        generatedAt: new Date(now).toISOString(),
         isLive: live.length > 0,
         liveWindowMinutes: windowMin,
-        designers: clean,
+        watching: teamIds.length ? "all files in configured teams" : "listed files",
+        filesWatched,
+        teamsConfigured: teamIds.length,
+        embedPolicy: allowAll ? "all files (unrestricted)" : "allowlist only",
+        designers,
         activities,
     })
 }
