@@ -17,7 +17,11 @@ interface ProjectFile {
     pages?: string[]
 }
  
-const FIGMA = "https://api.figma.com/v1"
+const FIGMA = "https://api.figma.com"
+ 
+/** Paths starting with /v2/ are passed through; everything else is v1. */
+const figmaUrl = (path: string) =>
+    path.startsWith("/v2/") ? `${FIGMA}${path}` : `${FIGMA}/v1${path}`
  
 const env = (k: string, d = "") => (process.env[k] ?? d).trim()
 const list = (k: string) =>
@@ -32,7 +36,7 @@ const trace: Array<{ call: string; status: number | string; note?: string }> = [
 async function figmaGet<T>(path: string, token: string): Promise<T | null> {
     const label = path.split("?")[0]
     try {
-        const res = await fetch(`${FIGMA}${path}`, {
+        const res = await fetch(figmaUrl(path), {
             headers: { "X-Figma-Token": token },
         })
         if (!res.ok) {
@@ -62,39 +66,65 @@ function hhmm(iso: string): string {
     ).padStart(2, "0")}`
 }
  
-/** Every file across every configured team, newest first. */
+/**
+ * Every file across every configured team, newest first.
+ *
+ * Uses Figma's v2 Folders API. Figma renamed "projects" to "folders"; the old
+ * /v1/teams/:id/projects endpoint needs the retired `projects:read` scope,
+ * which Figma no longer issues. These v2 endpoints use `folders:read`.
+ */
 async function filesAcrossTeams(
     teamIds: string[],
     token: string
 ): Promise<ProjectFile[]> {
     const out: ProjectFile[] = []
-    for (const teamId of teamIds) {
-        const projects = await figmaGet<{
-            projects?: Array<{ id: string; name: string }>
-        }>(`/teams/${teamId}/projects`, token)
-        const projectList = projects?.projects || []
+    const seenFolders = new Set<string>()
+ 
+    const readFolder = async (folder: { id: string; name?: string }, depth: number) => {
+        if (seenFolders.has(folder.id) || depth > 3) return
+        seenFolders.add(folder.id)
+ 
+        const files = await figmaGet<{ files?: ProjectFile[] }>(
+            `/v2/folders/${folder.id}/files`,
+            token
+        )
+        const fileList = files?.files || []
         trace.push({
-            call: `team ${teamId}`,
-            status: projects ? "ok" : "failed",
-            note: `${projectList.length} project(s)`,
+            call: `folder "${folder.name || folder.id}"`,
+            status: files ? "ok" : "failed",
+            note: `${fileList.length} file(s)`,
         })
-        for (const project of projectList) {
-            const files = await figmaGet<{ files?: ProjectFile[] }>(
-                `/projects/${project.id}/files`,
-                token
-            )
-            const fileList = files?.files || []
-            trace.push({
-                call: `project "${project.name}"`,
-                status: files ? "ok" : "failed",
-                note: `${fileList.length} file(s)`,
-            })
-            for (const f of fileList) {
-                if (f && f.key) out.push(f)
-            }
+        for (const f of fileList) if (f && f.key) out.push(f)
+ 
+        // Nested folders, where the account has them. Undocumented, so failure is fine.
+        const sub = await figmaGet<{ folders?: Array<{ id: string; name?: string }> }>(
+            `/v2/folders/${folder.id}/folders`,
+            token
+        )
+        for (const child of sub?.folders || []) {
+            if (child?.id) await readFolder(child, depth + 1)
         }
     }
-    return out.sort(
+ 
+    for (const teamId of teamIds) {
+        const res = await figmaGet<{
+            folders?: Array<{ id: string; name?: string }>
+        }>(`/v2/teams/${teamId}/folders`, token)
+        const folders = res?.folders || []
+        trace.push({
+            call: `team ${teamId}`,
+            status: res ? "ok" : "failed",
+            note: `${folders.length} folder(s)`,
+        })
+        for (const folder of folders) {
+            if (folder?.id) await readFolder(folder, 0)
+        }
+    }
+ 
+    // A file can sit in more than one place; keep one entry each.
+    const unique = new Map<string, ProjectFile>()
+    for (const f of out) unique.set(f.key, f)
+    return [...unique.values()].sort(
         (a, b) =>
             Date.parse(b.last_modified || "") - Date.parse(a.last_modified || "")
     )
@@ -312,7 +342,7 @@ export default async function handler(req: any, res: any) {
         diagnostics: {
             hint:
                 filesWatched === 0 && teamIds.length
-                    ? "Team scan returned nothing. Either the token lacks the Projects read scope, or the files live in Drafts (invisible to the projects API). Set WATCH_FILE_KEYS to a comma-separated list of file keys as a scope-free fallback."
+                    ? "Team scan returned nothing. Check the token has the folders:read scope, and that files live in a team folder rather than Drafts (Drafts are invisible to this API). WATCH_FILE_KEYS is the fallback."
                     : "",
             calls: trace,
         },
