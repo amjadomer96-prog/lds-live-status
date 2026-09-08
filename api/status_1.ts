@@ -317,18 +317,47 @@ export default async function handler(req: any, res: any) {
     const allowAll = env("ALLOW_ALL_EMBEDS").toLowerCase() === "true"
     const canEmbed = makeCanEmbed(allowAll, allowKeys, allowFolders)
  
-    // The studio roster. Order here is the order the page shows them in.
+    /**
+     * The studio roster. Order here is the order the page shows them in.
+     *
+     * Accepts a plain comma-separated list as well as JSON, because a long JSON
+     * string is easy to mangle when pasting into a hosting dashboard — and a
+     * silent parse failure looks exactly like "the feature is broken".
+     */
     let team: StudioDesigner[] = []
-    try {
-        const raw = env("DESIGNERS")
-        if (raw) {
-            const parsed = JSON.parse(raw)
-            if (Array.isArray(parsed)) {
-                team = parsed.filter((d) => d && typeof d.name === "string" && d.name)
+    let rosterStatus = "not set"
+    const rawTeam = env("DESIGNERS")
+    if (rawTeam) {
+        if (rawTeam.startsWith("[")) {
+            try {
+                const parsed = JSON.parse(rawTeam)
+                if (Array.isArray(parsed)) {
+                    team = parsed.filter(
+                        (d) => d && typeof d.name === "string" && d.name.trim()
+                    )
+                    rosterStatus = `ok, JSON (${team.length})`
+                } else {
+                    rosterStatus = "invalid: JSON is not an array"
+                }
+            } catch (e: any) {
+                rosterStatus = `invalid JSON: ${String(e?.message || e)}`
             }
+        } else {
+            team = rawTeam
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter(Boolean)
+                .map((entry) => {
+                    const [name, handle] = entry.split("=")
+                    return {
+                        name: (name || "").trim(),
+                        role: env("DESIGNER_ROLE", "Product Designer"),
+                        figmaHandle: (handle || "").trim() || undefined,
+                    }
+                })
+                .filter((d) => !!d.name)
+            rosterStatus = `ok, simple list (${team.length})`
         }
-    } catch {
-        /* malformed DESIGNERS: fall back to single-designer behaviour */
     }
     const windowMin = Number(env("LIVE_WINDOW_MINUTES", "10")) || 10
     const windowMs = windowMin * 60 * 1000
@@ -619,6 +648,7 @@ export default async function handler(req: any, res: any) {
                 : all.length === 0 && teamIds.length
                   ? "No files found. Check folders:read scope; files in Drafts are invisible to this API."
                   : "",
+            rosterStatus,
             roster: team.map((d) => d.name),
             editorsSeen: seenEditors.map((e) => e.handle).filter(Boolean),
             calls: trace,
