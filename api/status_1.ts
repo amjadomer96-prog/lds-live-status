@@ -39,7 +39,7 @@ interface ProjectFile {
 type Trace = Array<{ call: string; status: number | string; note?: string }>
  
 /** Stamped into every response so a stale deploy is obvious at a glance. */
-const SERVICE_VERSION = "v7-studio-fallback"
+const SERVICE_VERSION = "v9-no-double-count"
  
 const FIGMA = "https://api.figma.com"
  
@@ -242,6 +242,29 @@ function makeCanEmbed(
         const folder = (file.folder || "").trim().toLowerCase()
         return !!folder && allowFolders.has(folder)
     }
+}
+ 
+/**
+ * Fill in a file's Figma page names.
+ *
+ * Folder listings do not carry them, so the page has no "current task" to show.
+ * One extra call, made only for the file a designer is actually in.
+ */
+async function withPages(
+    file: ProjectFile,
+    token: string,
+    trace: Trace
+): Promise<ProjectFile> {
+    if (file.pages) return file
+    const detail = await figmaGet<{ document?: any }>(
+        `/files/${file.key}?depth=1`,
+        token,
+        trace
+    )
+    file.pages = (detail?.document?.children || [])
+        .map((c: any) => (c?.name || "").trim())
+        .filter(Boolean)
+    return file
 }
  
 const byNewest = (a: ProjectFile, b: ProjectFile) =>
@@ -540,6 +563,7 @@ export default async function handler(req: any, res: any) {
             const mine = (attributed.get(person.name) || []).sort(byNewest)
             const own = mine[0]
             const embeddable = own ? canEmbed(own) : false
+            if (own && embeddable) await withPages(own, token, trace)
             designers.push({
                 name: person.name,
                 role: person.role || "",
@@ -572,11 +596,18 @@ export default async function handler(req: any, res: any) {
         /* When a genuine edit cannot be attributed, the studio is still
            working. Show that under a neutral studio entry rather than either
            going dark (dishonest by omission) or crediting a designer at
-           random (dishonest outright). */
+           random (dishonest outright).
+        
+           Only when nobody was identified, though. One designer editing two
+           files would otherwise appear as two people working at once, which
+           overstates activity — and overstating is the failure mode this
+           feature must never have. */
         const orphans = (attributed.get(UNATTRIBUTED) || []).sort(byNewest)
-        if (team.length && attributionProblem && orphans.length) {
+        const someoneNamed = designers.some((d) => d.isLive)
+        if (team.length && attributionProblem && orphans.length && !someoneNamed) {
             const lead = orphans[0]
             const embeddable = canEmbed(lead)
+            if (embeddable) await withPages(lead, token, trace)
             designers.push({
                 name: env("STUDIO_NAME", "LDS Studio"),
                 role: "Studio session",
