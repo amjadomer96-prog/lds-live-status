@@ -39,7 +39,7 @@ interface ProjectFile {
 type Trace = Array<{ call: string; status: number | string; note?: string }>
  
 /** Stamped into every response so a stale deploy is obvious at a glance. */
-const SERVICE_VERSION = "v6-attribution"
+const SERVICE_VERSION = "v7-studio-fallback"
  
 const FIGMA = "https://api.figma.com"
  
@@ -566,6 +566,37 @@ export default async function handler(req: any, res: any) {
                         : "",
                 framerUrl: person.framerUrl || "",
                 privateSession: !!own && !embeddable,
+            })
+        }
+ 
+        /* When a genuine edit cannot be attributed, the studio is still
+           working. Show that under a neutral studio entry rather than either
+           going dark (dishonest by omission) or crediting a designer at
+           random (dishonest outright). */
+        const orphans = (attributed.get(UNATTRIBUTED) || []).sort(byNewest)
+        if (team.length && attributionProblem && orphans.length) {
+            const lead = orphans[0]
+            const embeddable = canEmbed(lead)
+            designers.push({
+                name: env("STUDIO_NAME", "LDS Studio"),
+                role: "Studio session",
+                avatar: "",
+                isLive: true,
+                project: embeddable ? lead.name : "A private project",
+                task: embeddable ? lead.pages?.[0] || "" : "",
+                platform: "figma",
+                sessionStartedAt:
+                    orphans[orphans.length - 1]?.last_modified ||
+                    lead.last_modified ||
+                    "",
+                lastUpdated: lead.last_modified || "",
+                figmaUrl: embeddable
+                    ? `https://www.figma.com/design/${lead.key}/${encodeURIComponent(
+                          (lead.name || "file").replace(/\s+/g, "-")
+                      )}`
+                    : "",
+                framerUrl: "",
+                privateSession: !embeddable,
             })
         }
  
