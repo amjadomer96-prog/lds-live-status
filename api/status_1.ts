@@ -39,7 +39,7 @@ interface ProjectFile {
 type Trace = Array<{ call: string; status: number | string; note?: string }>
  
 /** Stamped into every response so a stale deploy is obvious at a glance. */
-const SERVICE_VERSION = "v9-no-double-count"
+const SERVICE_VERSION = "v10-name-matching"
  
 const FIGMA = "https://api.figma.com"
  
@@ -331,15 +331,21 @@ function matchDesigner(
     }
     const handle = editor.handle.toLowerCase()
     if (!handle) return null
+    const byHandle = team.find(
+        (d) => (d.figmaHandle || "").trim().toLowerCase() === handle
+    )
+    if (byHandle) return byHandle
+ 
+    /* Fall back to the designer's own name appearing as a whole word anywhere
+       in the Figma display name. "Ubaid" matches "Ubaid Qureshi"; "Wasay"
+       matches "Abdul Wasay", where a prefix check would not. Whole-word only,
+       so "Ali" never matches "Alina". */
+    const words = handle.split(/[^\p{L}\p{N}]+/u).filter(Boolean)
     return (
-        team.find((d) => (d.figmaHandle || "").trim().toLowerCase() === handle) ||
-        // fall back to the designer's own name, so a handle of "Ubaid Khan"
-        // still matches a designer configured only as "Ubaid"
         team.find((d) => {
             const n = d.name.trim().toLowerCase()
-            return !!n && (handle === n || handle.startsWith(n + " "))
-        }) ||
-        null
+            return !!n && words.includes(n)
+        }) || null
     )
 }
  
