@@ -39,7 +39,7 @@ interface ProjectFile {
 type Trace = Array<{ call: string; status: number | string; note?: string }>
  
 /** Stamped into every response so a stale deploy is obvious at a glance. */
-const SERVICE_VERSION = "v5-roster"
+const SERVICE_VERSION = "v6-attribution"
  
 const FIGMA = "https://api.figma.com"
  
@@ -272,12 +272,16 @@ async function lastEditor(
     if (!res) {
         const failure = trace[before]
         const code = failure?.status
+        // Figma's own error text names the exact scope it wants. Quote it
+        // verbatim rather than guessing — the scope names have been renamed
+        // more than once.
+        const note = (failure?.note || "").trim()
         attributionProblem =
-            code === 403
-                ? "the Figma token is missing the file_versions:read scope, so edits cannot be matched to a designer"
-                : code === 429
-                  ? "Figma rate-limited the version lookups"
-                  : `version history unavailable (${String(code)})`
+            code === 429
+                ? "Figma rate-limited the version lookups"
+                : `version history unavailable (${String(code)})${
+                      note ? ` \u2014 Figma says: ${note}` : ""
+                  }`
     }
  
     const versions = [...(res?.versions || [])].sort(
