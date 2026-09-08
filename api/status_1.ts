@@ -373,7 +373,12 @@ export default async function handler(req: any, res: any) {
     if (!teamIds.length && !watchKeys.length && !explicit.length)
         return fail("missing_config")
  
-    /* ---------------- explicit files (per-designer mapping) ------------- */
+    /* ---------------- explicit files (per-designer mapping) ------------- *
+     * DESIGNERS is the modern roster and supersedes LIVE_STUDIO_CONFIG. Running
+     * both produced duplicate panels for the same person, so the roster wins.
+     * ------------------------------------------------------------------- */
+    if (team.length) explicit = []
+ 
     const designers: any[] = []
     for (const cfg of explicit) {
         const file = await figmaGet<{
@@ -559,6 +564,22 @@ export default async function handler(req: any, res: any) {
  
         seenEditors = editorsSeen
     }
+ 
+    // Last guard against two panels for one person: keep the working entry.
+    const byName = new Map<string, any>()
+    for (const d of designers) {
+        const key = (d.name || "").trim().toLowerCase()
+        const seen = byName.get(key)
+        if (!seen) byName.set(key, d)
+        else if (!seen.isLive && d.isLive) byName.set(key, d)
+        else if (seen.isLive === d.isLive) {
+            const a = Date.parse(seen.lastUpdated || "")
+            const b = Date.parse(d.lastUpdated || "")
+            if (!Number.isNaN(b) && (Number.isNaN(a) || b > a)) byName.set(key, d)
+        }
+    }
+    designers.length = 0
+    designers.push(...byName.values())
  
     const live = designers.filter((d) => d.isLive)
  
