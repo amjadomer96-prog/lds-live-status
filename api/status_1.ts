@@ -6,6 +6,25 @@ interface DesignerConfig {
     avatar?: string
 }
  
+/** A member of the studio, as configured in DESIGNERS. */
+interface StudioDesigner {
+    name: string
+    role?: string
+    avatar?: string
+    /** Figma display name, matched case-insensitively against version authors. */
+    figmaHandle?: string
+    /** Figma user id. More reliable than the handle when you have it. */
+    figmaUserId?: string
+    framerUrl?: string
+}
+ 
+/** Who last saved a file, from its version history. */
+interface Editor {
+    handle: string
+    id: string
+    at: string
+}
+ 
 interface ProjectFile {
     key: string
     name: string
@@ -13,6 +32,8 @@ interface ProjectFile {
     thumbnail_url?: string
     /** Figma page names. Only present on files fetched individually by key. */
     pages?: string[]
+    /** Folder this file was discovered in. Drives PUBLIC_FOLDER_NAMES. */
+    folder?: string
 }
  
 type Trace = Array<{ call: string; status: number | string; note?: string }>
@@ -39,6 +60,11 @@ let folderCache: { at: number; folders: Array<{ id: string; name?: string }> } |
     null
 let fileCache: { at: number; files: ProjectFile[] } | null = null
 const FOLDER_TTL_MS = 60 * 60 * 1000 // folders change rarely
+ 
+/** Cap on version-history lookups per scan, to stay inside Figma's limits. */
+const MAX_ATTRIBUTIONS = 8
+/** Bucket for edits by someone not on the roster. */
+const UNATTRIBUTED = "\u0000unattributed"
  
 /** Set true by figmaGet when Figma says we are going too fast. */
 let rateLimited = false
@@ -144,7 +170,9 @@ async function filesAcrossTeams(
             token,
             trace
         )
-        for (const f of files?.files || []) if (f?.key) out.push(f)
+        for (const f of files?.files || []) {
+            if (f?.key) out.push({ ...f, folder: folder.name || "" })
+        }
  
         if (scanSub && !rateLimited) {
             const sub = await figmaGet<{
@@ -191,8 +219,85 @@ async function filesByKeys(
     return out
 }
  
+/**
+ * May this file be put on a public web page?
+ *
+ * An embed publishes the ENTIRE Figma file to anyone who opens the site, so
+ * this stays deny-by-default. A file qualifies by living in an approved
+ * folder, or by being named outright.
+ */
+function makeCanEmbed(
+    allowAll: boolean,
+    allowKeys: Set<string>,
+    allowFolders: Set<string>
+) {
+    return (file: { key: string; folder?: string }) => {
+        if (allowAll) return true
+        if (allowKeys.has(file.key)) return true
+        const folder = (file.folder || "").trim().toLowerCase()
+        return !!folder && allowFolders.has(folder)
+    }
+}
+ 
 const byNewest = (a: ProjectFile, b: ProjectFile) =>
     Date.parse(b.last_modified || "") - Date.parse(a.last_modified || "")
+ 
+/**
+ * Who most recently saved this file.
+ *
+ * Figma's file endpoints carry lastModified but no author, so attribution has
+ * to come from version history. Versions are checkpoints rather than
+ * keystrokes, so this is "who made the last saved version", which is the best
+ * signal the REST API offers.
+ */
+async function lastEditor(
+    key: string,
+    token: string,
+    trace: Trace
+): Promise<Editor | null> {
+    const res = await figmaGet<{
+        versions?: Array<{
+            id: string
+            created_at?: string
+            user?: { id?: string; handle?: string }
+        }>
+    }>(`/files/${key}/versions?page_size=1`, token, trace)
+ 
+    const versions = [...(res?.versions || [])].sort(
+        (a, b) => Date.parse(b.created_at || "") - Date.parse(a.created_at || "")
+    )
+    const top = versions[0]
+    if (!top?.user) return null
+    return {
+        handle: (top.user.handle || "").trim(),
+        id: (top.user.id || "").trim(),
+        at: top.created_at || "",
+    }
+}
+ 
+/** Match an editor to a configured designer. Id wins over handle. */
+function matchDesigner(
+    editor: Editor | null,
+    team: StudioDesigner[]
+): StudioDesigner | null {
+    if (!editor) return null
+    if (editor.id) {
+        const byId = team.find((d) => d.figmaUserId && d.figmaUserId === editor.id)
+        if (byId) return byId
+    }
+    const handle = editor.handle.toLowerCase()
+    if (!handle) return null
+    return (
+        team.find((d) => (d.figmaHandle || "").trim().toLowerCase() === handle) ||
+        // fall back to the designer's own name, so a handle of "Ubaid Khan"
+        // still matches a designer configured only as "Ubaid"
+        team.find((d) => {
+            const n = d.name.trim().toLowerCase()
+            return !!n && (handle === n || handle.startsWith(n + " "))
+        }) ||
+        null
+    )
+}
  
 export default async function handler(req: any, res: any) {
     const trace: Trace = [] // request-local: warm lambdas run requests concurrently
@@ -206,7 +311,25 @@ export default async function handler(req: any, res: any) {
     const teamIds = list("FIGMA_TEAM_IDS")
     const watchKeys = list("WATCH_FILE_KEYS")
     const allowKeys = new Set(list("PUBLIC_FILE_KEYS"))
+    const allowFolders = new Set(
+        list("PUBLIC_FOLDER_NAMES").map((n) => n.toLowerCase())
+    )
     const allowAll = env("ALLOW_ALL_EMBEDS").toLowerCase() === "true"
+    const canEmbed = makeCanEmbed(allowAll, allowKeys, allowFolders)
+ 
+    // The studio roster. Order here is the order the page shows them in.
+    let team: StudioDesigner[] = []
+    try {
+        const raw = env("DESIGNERS")
+        if (raw) {
+            const parsed = JSON.parse(raw)
+            if (Array.isArray(parsed)) {
+                team = parsed.filter((d) => d && typeof d.name === "string" && d.name)
+            }
+        }
+    } catch {
+        /* malformed DESIGNERS: fall back to single-designer behaviour */
+    }
     const windowMin = Number(env("LIVE_WINDOW_MINUTES", "10")) || 10
     const windowMs = windowMin * 60 * 1000
     const refreshMs = (Number(env("REFRESH_SECONDS", "180")) || 180) * 1000
@@ -261,7 +384,7 @@ export default async function handler(req: any, res: any) {
         if (!file) continue
         const modified = Date.parse(file.lastModified)
         const isLive = !Number.isNaN(modified) && now - modified <= windowMs
-        const canEmbed = allowAll || allowKeys.has(cfg.fileKey)
+        const embeddable = canEmbed({ key: cfg.fileKey })
         const pages = (file.document?.children || [])
             .map((c: any) => (c?.name || "").trim())
             .filter(Boolean)
@@ -270,23 +393,24 @@ export default async function handler(req: any, res: any) {
             role: cfg.role || "",
             avatar: cfg.avatar || "",
             isLive,
-            project: canEmbed ? file.name : "A private project",
-            task: canEmbed ? pages[0] || "" : "",
+            project: embeddable ? file.name : "A private project",
+            task: embeddable ? pages[0] || "" : "",
             platform: "figma",
             sessionStartedAt: isLive ? file.lastModified : "",
             lastUpdated: file.lastModified,
-            figmaUrl: canEmbed
+            figmaUrl: embeddable
                 ? `https://www.figma.com/design/${cfg.fileKey}/${encodeURIComponent(
                       file.name.replace(/\s+/g, "-")
                   )}`
                 : "",
             framerUrl: cfg.framerUrl || "",
-            privateSession: isLive && !canEmbed,
+            privateSession: isLive && !embeddable,
         })
     }
  
     /* ---------------- broad detection ----------------------------------- */
-    let activities: Array<{ time: string; title: string }> = []
+    let activities: Array<{ time: string; title: string; designer?: string }> = []
+    let seenEditors: Editor[] = []
     let all: ProjectFile[] = []
     let scanned = false
  
@@ -324,46 +448,84 @@ export default async function handler(req: any, res: any) {
             const t = Date.parse(f.last_modified || "")
             return !Number.isNaN(t) && now - t <= windowMs
         })
-        const active = recent[0]
-        const coveredByExplicit = active
-            ? explicit.some((c) => c.fileKey === active.key)
-            : false
+        // Attribute each recent file to whoever saved it last. Only recent
+        // files cost a call, so an idle studio costs nothing.
+        const editors = new Map<string, Editor | null>()
+        const attributed = new Map<string, ProjectFile[]>()
+        const editorsSeen: Editor[] = []
  
-        if (active && !coveredByExplicit) {
-            const canEmbed = allowAll || allowKeys.has(active.key)
+        if (team.length) {
+            for (const f of recent.slice(0, MAX_ATTRIBUTIONS)) {
+                const editor = await lastEditor(f.key, token, trace)
+                editors.set(f.key, editor)
+                if (editor) editorsSeen.push(editor)
+                const who = matchDesigner(editor, team)
+                const bucket = who ? who.name : UNATTRIBUTED
+                attributed.set(bucket, [...(attributed.get(bucket) || []), f])
+            }
+        }
+ 
+        // One entry per configured designer, always — the page lists the whole
+        // team and marks who is actually working.
+        for (const person of team) {
+            const mine = (attributed.get(person.name) || []).sort(byNewest)
+            const own = mine[0]
+            const embeddable = own ? canEmbed(own) : false
+            designers.push({
+                name: person.name,
+                role: person.role || "",
+                avatar: person.avatar || "",
+                isLive: !!own,
+                project: !own
+                    ? ""
+                    : embeddable
+                      ? own.name
+                      : "A private project",
+                task: own && embeddable ? own.pages?.[0] || "" : "",
+                platform: "figma",
+                sessionStartedAt: own
+                    ? mine[mine.length - 1]?.last_modified ||
+                      own.last_modified ||
+                      ""
+                    : "",
+                lastUpdated: own?.last_modified || "",
+                figmaUrl:
+                    own && embeddable
+                        ? `https://www.figma.com/design/${own.key}/${encodeURIComponent(
+                              (own.name || "file").replace(/\s+/g, "-")
+                          )}`
+                        : "",
+                framerUrl: person.framerUrl || "",
+                privateSession: !!own && !embeddable,
+            })
+        }
+ 
+        // No DESIGNERS configured: keep the original single-designer shape.
+        const active = recent[0]
+        if (!team.length && active && !explicit.some((c) => c.fileKey === active.key)) {
+            const embeddable = canEmbed(active)
             designers.push({
                 name: env("DESIGNER_NAME", "Arham"),
                 role: env("DESIGNER_ROLE", "Product Designer"),
                 avatar: "",
                 isLive: true,
-                project: canEmbed ? active.name : "A private project",
-                task: canEmbed ? active.pages?.[0] || "" : "",
+                project: embeddable ? active.name : "A private project",
+                task: embeddable ? active.pages?.[0] || "" : "",
                 platform: "figma",
                 sessionStartedAt:
                     recent[recent.length - 1]?.last_modified ||
                     active.last_modified ||
                     "",
                 lastUpdated: active.last_modified || "",
-                figmaUrl: canEmbed
+                figmaUrl: embeddable
                     ? `https://www.figma.com/design/${active.key}/${encodeURIComponent(
                           (active.name || "file").replace(/\s+/g, "-")
                       )}`
                     : "",
                 framerUrl: "",
-                privateSession: !canEmbed,
+                privateSession: !embeddable,
             })
- 
-            activities = recent
-                .slice(0, 6)
-                .map((f) => ({
-                    time: hhmm(f.last_modified || ""),
-                    title:
-                        allowAll || allowKeys.has(f.key)
-                            ? `Updated ${f.name}`
-                            : "Worked on a private project",
-                }))
-                .filter((a) => a.time)
-        } else if (!explicit.length && !active) {
+        } else if (!team.length && !explicit.length && !active) {
             designers.push({
                 name: env("DESIGNER_NAME", "Arham"),
                 role: env("DESIGNER_ROLE", "Product Designer"),
@@ -379,6 +541,23 @@ export default async function handler(req: any, res: any) {
                 privateSession: false,
             })
         }
+ 
+        activities = recent
+            .slice(0, 6)
+            .map((f) => {
+                const who = matchDesigner(editors.get(f.key) || null, team)
+                const what = canEmbed(f)
+                    ? `Updated ${f.name}`
+                    : "Worked on a private project"
+                return {
+                    time: hhmm(f.last_modified || ""),
+                    title: who ? `${who.name} — ${what}` : what,
+                    designer: who?.name || "",
+                }
+            })
+            .filter((a) => a.time)
+ 
+        seenEditors = editorsSeen
     }
  
     const live = designers.filter((d) => d.isLive)
@@ -406,8 +585,11 @@ export default async function handler(req: any, res: any) {
             filesWatched: all.length,
             teamsConfigured: teamIds.length,
             embedPolicy: allowAll
-                ? "all files (UNRESTRICTED — client work can be published)"
-                : `allowlist only (${allowKeys.size} file(s))`,
+                ? "ALL FILES — UNRESTRICTED. Client work will be published."
+                : `${allowFolders.size} folder(s) + ${allowKeys.size} file(s)`,
+            foldersSeen: [
+                ...new Set(all.map((f) => f.folder).filter(Boolean)),
+            ].sort(),
             scannedThisRequest: scanned,
             rateLimited,
             refreshSeconds: Math.floor(refreshMs / 1000),
@@ -416,6 +598,8 @@ export default async function handler(req: any, res: any) {
                 : all.length === 0 && teamIds.length
                   ? "No files found. Check folders:read scope; files in Drafts are invisible to this API."
                   : "",
+            roster: team.map((d) => d.name),
+            editorsSeen: seenEditors.map((e) => e.handle).filter(Boolean),
             calls: trace,
         }
     }
