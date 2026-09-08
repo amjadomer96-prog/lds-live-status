@@ -71,6 +71,8 @@ const UNATTRIBUTED = "\u0000unattributed"
  
 /** Set true by figmaGet when Figma says we are going too fast. */
 let rateLimited = false
+/** Why attribution could not run, if it could not. Public-safe text only. */
+let attributionProblem = ""
  
 async function figmaGet<T>(
     path: string,
@@ -258,6 +260,7 @@ async function lastEditor(
     token: string,
     trace: Trace
 ): Promise<Editor | null> {
+    const before = trace.length
     const res = await figmaGet<{
         versions?: Array<{
             id: string
@@ -265,6 +268,17 @@ async function lastEditor(
             user?: { id?: string; handle?: string }
         }>
     }>(`/files/${key}/versions?page_size=1`, token, trace)
+ 
+    if (!res) {
+        const failure = trace[before]
+        const code = failure?.status
+        attributionProblem =
+            code === 403
+                ? "the Figma token is missing the file_versions:read scope, so edits cannot be matched to a designer"
+                : code === 429
+                  ? "Figma rate-limited the version lookups"
+                  : `version history unavailable (${String(code)})`
+    }
  
     const versions = [...(res?.versions || [])].sort(
         (a, b) => Date.parse(b.created_at || "") - Date.parse(a.created_at || "")
@@ -487,6 +501,7 @@ export default async function handler(req: any, res: any) {
         })
         // Attribute each recent file to whoever saved it last. Only recent
         // files cost a call, so an idle studio costs nothing.
+        attributionProblem = ""
         const editors = new Map<string, Editor | null>()
         const attributed = new Map<string, ProjectFile[]>()
         const editorsSeen: Editor[] = []
@@ -500,6 +515,19 @@ export default async function handler(req: any, res: any) {
                 const bucket = who ? who.name : UNATTRIBUTED
                 attributed.set(bucket, [...(attributed.get(bucket) || []), f])
             }
+        }
+ 
+        // An edit by someone who is not on the roster is not a bug in the
+        // token — say so plainly rather than leaving the page silently dead.
+        if (!attributionProblem && (attributed.get(UNATTRIBUTED) || []).length) {
+            const names = [
+                ...new Set(editorsSeen.map((e) => e.handle).filter(Boolean)),
+            ]
+            attributionProblem = names.length
+                ? `recent edits were made by ${names.join(
+                      ", "
+                  )}, who is not in DESIGNERS — add them, or map an existing name with Name=Figma Display Name`
+                : "recent edits could not be matched to anyone on the roster"
         }
  
         // One entry per configured designer, always — the page lists the whole
@@ -627,6 +655,9 @@ export default async function handler(req: any, res: any) {
         // Safe in public: it reports only whether the roster parsed, and the
         // roster is the same set of names the page already displays.
         roster: rosterStatus,
+        // Empty when attribution is working. Names Figma display names only,
+        // which are the studio's own people, never client or file data.
+        attribution: attributionProblem,
         isLive: live.length > 0,
         liveWindowMinutes: windowMin,
         designers,
