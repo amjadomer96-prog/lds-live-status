@@ -38,6 +38,9 @@ interface ProjectFile {
  
 type Trace = Array<{ call: string; status: number | string; note?: string }>
  
+/** Stamped into every response so a stale deploy is obvious at a glance. */
+const SERVICE_VERSION = "v5-roster"
+ 
 const FIGMA = "https://api.figma.com"
  
 /** Paths starting with /v2/ pass through; everything else is v1. */
@@ -618,6 +621,12 @@ export default async function handler(req: any, res: any) {
      * ------------------------------------------------------------------- */
     const payload: any = {
         generatedAt: new Date(now).toISOString(),
+        // Bumped whenever this file changes, so "is my paste actually live?"
+        // is answerable without the debug key.
+        service: SERVICE_VERSION,
+        // Safe in public: it reports only whether the roster parsed, and the
+        // roster is the same set of names the page already displays.
+        roster: rosterStatus,
         isLive: live.length > 0,
         liveWindowMinutes: windowMin,
         designers,
@@ -648,8 +657,7 @@ export default async function handler(req: any, res: any) {
                 : all.length === 0 && teamIds.length
                   ? "No files found. Check folders:read scope; files in Drafts are invisible to this API."
                   : "",
-            rosterStatus,
-            roster: team.map((d) => d.name),
+            rosterNames: team.map((d) => d.name),
             editorsSeen: seenEditors.map((e) => e.handle).filter(Boolean),
             calls: trace,
         }
